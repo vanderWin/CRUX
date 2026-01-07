@@ -1,0 +1,178 @@
+const CRUX_API_KEY = 'AIzaSyCDUaTJUMcX5pORAMpVuhbKD1wXJyqlXKg';
+function onOpen() {
+  const ui = SpreadsheetApp.getUi();
+  ui.createMenu('CWV Tools')
+    .addItem('Update All', 'updateEverything')
+    .addItem('Update CrUX Only', 'updateCrUXMetricsManually')
+    .addItem('Fetch LCP Only', 'fetchLCPInfo')
+    .addItem('Fetch INP Only', 'fetchINPInfo')
+    .addItem('Fetch CLS Only', 'fetchCLSInfo')
+    .addItem('Fetch FCP Only', 'fetchFCPInfo')
+    .addItem('Fetch TTFB Only', 'fetchTTFBInfo')
+    .addToUi();
+}
+function updateEverything() {
+  updateCrUXMetricsManually();
+  fetchLCPInfo();
+  fetchINPInfo();
+  fetchCLSInfo();
+  fetchFCPInfo();
+  fetchTTFBInfo();
+}
+function getCrUXRecord(url) {
+  const endpoint = `https://chromeuxreport.googleapis.com/v1/records:queryRecord?key=${CRUX_API_KEY}`;
+  const payload = { url: url };
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+  const response = UrlFetchApp.fetch(endpoint, options);
+  return JSON.parse(response.getContentText());
+}
+function getDensity(data, metric, index) {
+  try {
+    return data.record.metrics[metric].histogram[index].density;
+  } catch (e) {
+    return "";
+  }
+}
+function getLabel(score) {
+  if (score >= 0.9) return 'Good';
+  if (score >= 0.5) return 'Needs Improvement';
+  if (score >= 0) return 'Poor';
+  return 'Unknown';
+}
+function updateCrUXMetricsManually() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("CrUX");
+  if (!sheet) {
+    SpreadsheetApp.getUi().alert('Sheet named "CrUX" not found.');
+    return;
+  }
+  const urls = sheet.getRange("A3:A" + sheet.getLastRow()).getValues();
+  sheet.getRange("A1").setValue("Running...");
+  SpreadsheetApp.flush();
+  Utilities.sleep(500);
+  urls.forEach((row, i) => {
+    const origin = row[0];
+    if (origin) {
+      const data = getCrUXRecord(origin);
+      const values = [
+        getDensity(data, "largest_contentful_paint", 0),
+        getDensity(data, "largest_contentful_paint", 1),
+        getDensity(data, "largest_contentful_paint", 2),
+        getDensity(data, "interaction_to_next_paint", 0),
+        getDensity(data, "interaction_to_next_paint", 1),
+        getDensity(data, "interaction_to_next_paint", 2),
+        getDensity(data, "cumulative_layout_shift", 0),
+        getDensity(data, "cumulative_layout_shift", 1),
+        getDensity(data, "cumulative_layout_shift", 2),
+        getDensity(data, "first_contentful_paint", 0),
+        getDensity(data, "first_contentful_paint", 1),
+        getDensity(data, "first_contentful_paint", 2),
+        getDensity(data, "experimental_time_to_first_byte", 0),
+        getDensity(data, "experimental_time_to_first_byte", 1),
+        getDensity(data, "experimental_time_to_first_byte", 2)
+      ];
+      sheet.getRange(i + 3, 2, 1, values.length).setValues([values]);
+      Utilities.sleep(450);
+    }
+  });
+  sheet.getRange("A1").setValue("Last Update: " + new Date().toLocaleString());
+}
+// --- LCP ---
+function fetchLCPInfo() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("LCP");
+  if (!sheet) return;
+  const url = sheet.getRange("B2").getValue();
+  const apiUrl = `https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=${encodeURIComponent(url)}&strategy=mobile&key=${CRUX_API_KEY}`;
+  try {
+    const json = JSON.parse(UrlFetchApp.fetch(apiUrl).getContentText());
+    const audit = json.lighthouseResult?.audits?.['largest-contentful-paint'];
+    const value = audit?.displayValue || 'N/A';
+    const score = audit?.score ?? -1;
+    sheet.getRange("C5").setValue(value);
+    sheet.getRange("D5").setValue(getLabel(score));
+    sheet.getRange("E5").setValue(score >= 0 ? Math.round(score * 100) + " / 100" : "N/A");
+  } catch (e) {
+    sheet.getRange("C5:E5").setValues([['Error', 'Error', 'Error']]);
+  }
+}
+// --- INP ---
+function fetchINPInfo() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("INP");
+  if (!sheet) return;
+  const url = sheet.getRange("B2").getValue();
+  const apiUrl = `https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=${encodeURIComponent(url)}&strategy=mobile&key=${CRUX_API_KEY}`;
+  try {
+    const json = JSON.parse(UrlFetchApp.fetch(apiUrl).getContentText());
+    // Note the corrected audit key
+    const audit = json.lighthouseResult?.audits?.['experimental-interaction-to-next-paint'];
+    const value = audit?.displayValue || 'N/A';
+    const score = audit?.score ?? -1;
+    sheet.getRange("C5").setValue(value);
+    sheet.getRange("D5").setValue(getLabel(score));
+    sheet.getRange("E5").setValue(score >= 0 ? Math.round(score * 100) + " / 100" : "N/A");
+  } catch (e) {
+    sheet.getRange("C5:E5").setValues([['Error', 'Error', 'Error']]);
+  }
+}
+// --- CLS ---
+function fetchCLSInfo() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("CLS");
+  if (!sheet) return;
+  const url = sheet.getRange("B2").getValue();
+  const apiUrl = `https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=${encodeURIComponent(url)}&strategy=mobile&key=${CRUX_API_KEY}`;
+  try {
+    const json = JSON.parse(UrlFetchApp.fetch(apiUrl).getContentText());
+    const audit = json.lighthouseResult?.audits?.['cumulative-layout-shift'];
+    const value = audit?.displayValue || 'N/A';
+    const score = audit?.score ?? -1;
+    sheet.getRange("C5").setValue(value);
+    sheet.getRange("D5").setValue(getLabel(score));
+    sheet.getRange("E5").setValue(score >= 0 ? Math.round(score * 100) + " / 100" : "N/A");
+  } catch (e) {
+    sheet.getRange("C5:E5").setValues([['Error', 'Error', 'Error']]);
+  }
+}
+// --- FCP ---
+function fetchFCPInfo() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("FCP");
+  if (!sheet) return;
+  const url = sheet.getRange("B2").getValue();
+  const apiUrl = `https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=${encodeURIComponent(url)}&strategy=mobile&key=${CRUX_API_KEY}`;
+  try {
+    const json = JSON.parse(UrlFetchApp.fetch(apiUrl).getContentText());
+    const audit = json.lighthouseResult?.audits?.['first-contentful-paint'];
+    const value = audit?.displayValue || 'N/A';
+    const score = audit?.score ?? -1;
+    sheet.getRange("C5").setValue(value);
+    sheet.getRange("D5").setValue(getLabel(score));
+    sheet.getRange("E5").setValue(score >= 0 ? Math.round(score * 100) + " / 100" : "N/A");
+  } catch (e) {
+    sheet.getRange("C5:E5").setValues([['Error', 'Error', 'Error']]);
+  }
+}
+// --- TTFB ---
+function fetchTTFBInfo() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("TTFB");
+  if (!sheet) return;
+  const url = sheet.getRange("B2").getValue();
+  const apiUrl = `https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=${encodeURIComponent(url)}&strategy=mobile&key=${CRUX_API_KEY}`;
+  try {
+    const json = JSON.parse(UrlFetchApp.fetch(apiUrl).getContentText());
+    const audit = json.lighthouseResult?.audits?.['server-response-time'];
+    
+    let value = audit?.displayValue || 'N/A';
+    if (value.startsWith("Root document took")) {
+      value = value.replace("Root document took", "").trim();
+    }
+    const score = audit?.score ?? -1;
+    sheet.getRange("C5").setValue(value); // e.g., "950 ms"
+    sheet.getRange("D5").setValue(getLabel(score));
+    sheet.getRange("E5").setValue(score >= 0 ? Math.round(score * 100) + " / 100" : "N/A");
+  } catch (e) {
+    sheet.getRange("C5:E5").setValues([['Error', 'Error', 'Error']]);
+  }
+}

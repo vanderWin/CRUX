@@ -57,9 +57,30 @@ TREND_TOLERANCE = {
 }
 
 STATUS_COLORS = {
-    "Good": "#188038",
-    "Needs Improvement": "#f29900",
-    "Poor": "#d93025",
+    "Good": "#0B8043",
+    "Needs Improvement": "#F09300",
+    "Poor": "#C53929",
+}
+
+
+def lighten_hex(hex_color: str, factor: float = 0.8) -> str:
+    value = hex_color.lstrip("#")
+    if len(value) != 6:
+        return hex_color
+    try:
+        red = int(value[0:2], 16)
+        green = int(value[2:4], 16)
+        blue = int(value[4:6], 16)
+    except ValueError:
+        return hex_color
+    red = round(red + (255 - red) * factor)
+    green = round(green + (255 - green) * factor)
+    blue = round(blue + (255 - blue) * factor)
+    return f"#{red:02X}{green:02X}{blue:02X}"
+
+
+STATUS_COLORS_LIGHT = {
+    key: lighten_hex(value, 0.82) for key, value in STATUS_COLORS.items()
 }
 
 TREND_COLORS = {
@@ -110,6 +131,18 @@ def read_urls_from_upload(upload) -> List[str]:
         value = raw.strip()
         if value.startswith(("http://", "https://")):
             urls.append(value)
+    return unique_preserve(urls)
+
+
+def read_urls_from_text(text: str) -> List[str]:
+    if not text:
+        return []
+    urls: List[str] = []
+    for line in text.splitlines():
+        for raw in line.replace(",", " ").split():
+            value = raw.strip()
+            if value.startswith(("http://", "https://")):
+                urls.append(value)
     return unique_preserve(urls)
 
 
@@ -492,7 +525,12 @@ def build_cwv_chart(history_df: pd.DataFrame) -> alt.Chart:
             "rating:N",
             scale=alt.Scale(
                 domain=["Good", "Needs Improvement", "Poor", "Unknown"],
-                range=["#188038", "#f29900", "#d93025", "#9aa0a6"],
+                range=[
+                    STATUS_COLORS["Good"],
+                    STATUS_COLORS["Needs Improvement"],
+                    STATUS_COLORS["Poor"],
+                    "#9aa0a6",
+                ],
             ),
             legend=None,
         ),
@@ -583,7 +621,12 @@ def build_device_metric_chart(
     )
 
     status_domain = ["Good", "Needs Improvement", "Poor", "Unknown"]
-    status_range = ["#188038", "#f29900", "#d93025", "#9aa0a6"]
+    status_range = [
+        STATUS_COLORS["Good"],
+        STATUS_COLORS["Needs Improvement"],
+        STATUS_COLORS["Poor"],
+        "#9aa0a6",
+    ]
     metric_label = METRIC_VIS[metric_key]["label"]
     axis_title = metric_label
     if metric_key in ("lcp", "inp"):
@@ -777,6 +820,29 @@ def coerce_float(value: Optional[object]) -> Optional[float]:
     return None
 
 
+def format_share_percent(value: Optional[object]) -> Optional[float]:
+    numeric = coerce_float(value)
+    if numeric is None:
+        return None
+    return round(numeric * 100, 1)
+
+
+def format_share_display(value: Optional[object]) -> str:
+    numeric = coerce_float(value)
+    if numeric is None:
+        return ""
+    return f"{numeric:.1f}%"
+
+
+def style_status_cell(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    color = STATUS_COLORS_LIGHT.get(value)
+    if not color:
+        return ""
+    return f"background-color: {color}; font-weight: 600;"
+
+
 def normalize_metric_value(metric_key: str, value: Optional[object]) -> Optional[float]:
     numeric = coerce_float(value)
     if numeric is None:
@@ -856,6 +922,23 @@ def parse_crux_response(data: Dict) -> Dict:
     return row
 
 
+def build_export_headers() -> Dict[str, str]:
+    headers = {
+        "url": "URL",
+        "collection_period": "Collection period",
+        "form_factor": "Form factor",
+    }
+    for metric_key in METRIC_DEFS.keys():
+        label = metric_key.upper()
+        unit = " (ms)" if metric_key in ("lcp", "inp", "fcp", "ttfb") else ""
+        headers[f"{metric_key}_p75"] = f"{label} p75{unit}"
+        headers[f"{metric_key}_rating"] = f"{label} status"
+        headers[f"{metric_key}_good"] = f"{label} good share (%)"
+        headers[f"{metric_key}_ni"] = f"{label} needs improvement share (%)"
+        headers[f"{metric_key}_poor"] = f"{label} poor share (%)"
+    return headers
+
+
 def parse_error_message(resp: requests.Response) -> str:
     try:
         data = resp.json()
@@ -899,9 +982,15 @@ def get_default_api_key() -> str:
 
 def main() -> None:
     load_dotenv()
-    st.set_page_config(page_title="CrUX CWV Fetcher", layout="wide")
-    st.title("CrUX CWV Fetcher")
-    st.caption("Load URLs from a CSV or sitemaps and pull Core Web Vitals field data from the CrUX API.")
+    st.set_page_config(
+        page_title="Bulk CrUX Fetcher | Journey Further",
+        page_icon="favicon.png",
+        layout="wide",
+    )
+    st.title("Bulk CrUX Fetcher")
+    st.caption(
+        "Paste URL lists, upload a CSV, or fetch from sitemaps to pull Core Web Vitals field data from the CrUX API."
+    )
     st.markdown(
         "<style>"
         ".summary-row{margin:0.2rem 0 0.6rem;font-size:1.05rem;}"
@@ -912,7 +1001,7 @@ def main() -> None:
 
     st.subheader("Origin summary")
     origin_input = st.text_input(
-        "Origin (scheme + domain)",
+        "Enter a site to fetch a summary. (Unlocks sitemap crawling)",
         value="",
         placeholder="https://www.example.com",
         help="You can paste a domain like example.com; https:// will be assumed.",
@@ -929,13 +1018,19 @@ def main() -> None:
     origin_summary = st.container()
 
     with st.sidebar:
-        st.caption("API key comes from `.env` or Streamlit secrets.")
         form_factor = st.selectbox("Form factor", ["ALL", "PHONE", "DESKTOP", "TABLET"])
-        delay = st.slider("Delay between requests (seconds)", 0.0, 2.0, 0.4, 0.1)
+        delay = st.slider("Delay between requests (seconds)", 0.0, 2.0, 0.5, 0.1)
 
-    st.subheader("Input")
-    source_choice = st.radio("URL source", ["CSV", "Sitemaps"], horizontal=True)
+    st.subheader("Choose an Input")
+    source_choice = st.radio(
+        "URL source",
+        ["Paste URLs", "CSV upload", "Sitemaps"],
+        horizontal=True,
+        index=0,
+    )
     urls_preview: List[str] = []
+    upload = None
+    pasted_urls = ""
 
     if "sitemap_urls" not in st.session_state:
         st.session_state["sitemap_urls"] = []
@@ -955,15 +1050,22 @@ def main() -> None:
     elif summary_data:
         render_origin_summary(origin_summary, summary_data, show_device_split)
 
-    if source_choice == "CSV":
+    if source_choice == "Paste URLs":
+        pasted_urls = st.text_area(
+            "Paste URLs (one per line)",
+            height=160,
+            placeholder="https://www.example.com/page\nhttps://www.example.com/other",
+        )
+        urls_preview = read_urls_from_text(pasted_urls)
+        st.write(f"Found {len(urls_preview)} URL(s).")
+    elif source_choice == "CSV upload":
         upload = st.file_uploader("Upload CSV", type=["csv"])
-        csv_path = st.text_input("Or read from CSV path", value="pages.csv")
-        urls_preview = read_urls_from_upload(upload) if upload else read_urls_from_csv(csv_path)
+        urls_preview = read_urls_from_upload(upload)
         st.write(f"Found {len(urls_preview)} URL(s).")
     else:
         max_sitemaps = st.number_input("Max sitemaps to crawl", 1, 200, 20, 1)
         max_urls = st.number_input("Max URLs to fetch", 1, 10000, 500, 50)
-        st.caption("Sitemaps are discovered via robots.txt and sitemap indexes.")
+        st.caption("Sitemaps are discovered via the robots.txt of the origin specified above. Subject to firewalls.")
 
         if st.button("Fetch sitemaps"):
             normalized_origin = normalize_origin_input(origin_input)
@@ -1001,15 +1103,20 @@ def main() -> None:
             return
 
         urls: List[str] = []
-        if source_choice == "CSV":
-            urls = read_urls_from_upload(upload) if upload else read_urls_from_csv(csv_path)
+        if source_choice == "Paste URLs":
+            urls = read_urls_from_text(pasted_urls)
+            if not urls:
+                st.error("No valid URLs found in the pasted list.")
+                return
+        elif source_choice == "CSV upload":
+            urls = read_urls_from_upload(upload)
             if not urls:
                 st.error("No valid URLs found in the CSV.")
                 return
         else:
             urls = st.session_state.get("sitemap_urls", [])
             if not urls:
-                st.error("Fetch sitemaps first or switch to CSV input.")
+                st.error("Fetch sitemaps first or switch to Paste URLs or CSV upload.")
                 return
 
         if urls:
@@ -1033,16 +1140,17 @@ def main() -> None:
                     time.sleep(delay)
 
             status.write("Done.")
-            df = pd.DataFrame(results).rename(
-                columns={
-                    "lcp_p75": "LCP",
-                    "inp_p75": "INP",
-                    "cls_p75": "CLS",
-                    "fcp_p75": "FCP",
-                    "ttfb_p75": "TTFB",
-                }
-            )
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            df = pd.DataFrame(results).rename(columns=build_export_headers())
+            share_cols = [col for col in df.columns if col.endswith("share (%)")]
+            for col in share_cols:
+                df[col] = df[col].map(format_share_percent)
+            status_cols = [col for col in df.columns if col.endswith(" status")]
+            styled_df = df.style
+            if share_cols:
+                styled_df = styled_df.format({col: format_share_display for col in share_cols})
+            if status_cols:
+                styled_df = styled_df.applymap(style_status_cell, subset=status_cols)
+            st.dataframe(styled_df, use_container_width=True, hide_index=True)
             st.download_button(
                 "Download results CSV",
                 data=df.to_csv(index=False),
@@ -1060,3 +1168,45 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# ===== Centered footer (replaces sidebar logo & copyright) =====
+import base64, mimetypes, datetime, os
+from pathlib import Path
+
+def _data_uri_for_logo():
+    # try common locations / names
+    candidates = [
+        Path("logo.svg"), Path("logo.png"),
+        Path("static/logo.svg"), Path("static/logo.png")
+    ]
+    for p in candidates:
+        if p.exists():
+            mime = mimetypes.guess_type(p.name)[0] or "image/png"
+            b64 = base64.b64encode(p.read_bytes()).decode("utf-8")
+            return f"data:{mime};base64,{b64}"
+    return None  # fallback: no logo found
+
+def render_footer(bg="#2b0573", max_h=70):
+    current_year = datetime.datetime.now().year
+    logo_uri = _data_uri_for_logo()
+
+    img_html = (
+        f'<img src="{logo_uri}" style="max-height:{max_h}px; width:auto; margin-bottom:0px;" />'
+        if logo_uri else ""
+    )
+
+    st.markdown(
+        f"""
+        <div style="background:{bg}; padding:5px; text-align:center; margin-top:40px; border-radius:10px; ">
+            {img_html}
+            <div style="color:#fff; font-size:0.9em;">
+                &copy; {current_year}
+                <a href="https://www.journeyfurther.com/?utm_source=bulk-crux-tool&utm_medium=footer&utm_campaign=bulk-crux-tool"
+                   target="_blank" style="color:#fff; text-decoration:none;">Journey Further</a>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+render_footer()  # call at the very end of the script

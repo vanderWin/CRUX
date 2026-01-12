@@ -2,11 +2,13 @@ import gzip
 import os
 import time
 import xml.etree.ElementTree as ET
+from io import BytesIO
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 import altair as alt
 import pandas as pd
+import plotly.express as px
 import requests
 import streamlit as st
 from dotenv import load_dotenv
@@ -43,6 +45,14 @@ METRIC_DEFS = {
         "label": "Time to First Byte (ms)",
     },
 }
+
+SUMMARY_METRICS = ["lcp", "inp", "cls", "fcp", "ttfb"]
+SUMMARY_SHARE_LABELS = [
+    ("good", "Good"),
+    ("ni", "Needs Improvement"),
+    ("poor", "Poor"),
+]
+SUMMARY_METRICS_UPPER = [metric.upper() for metric in SUMMARY_METRICS]
 
 HISTORY_METRICS = {
     "lcp": "largest_contentful_paint",
@@ -144,6 +154,32 @@ def read_urls_from_text(text: str) -> List[str]:
             if value.startswith(("http://", "https://")):
                 urls.append(value)
     return unique_preserve(urls)
+
+
+def categorize_url(url: str) -> str:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return ""
+    path = parsed.path or ""
+    if not path or path == "/":
+        return "Home"
+    segment = path.lstrip("/").split("/", 1)[0].strip()
+    if not segment:
+        return "Home"
+    return segment.replace("-", " ").title()
+
+
+def read_sitemap_seeds_from_text(text: str) -> List[str]:
+    if not text:
+        return []
+    seeds: List[str] = []
+    for line in text.splitlines():
+        for raw in line.replace(",", " ").split():
+            value = raw.strip()
+            if value:
+                seeds.append(value)
+    return unique_preserve(seeds)
 
 
 def normalize_site_input(value: str) -> str:
@@ -248,23 +284,40 @@ def discover_urls_from_sitemaps(
     site_input: str,
     max_sitemaps: int,
     max_urls: int,
+    seed_sitemaps: Optional[List[str]] = None,
 ) -> Tuple[List[str], List[str], Dict[str, int]]:
     site_url = normalize_site_input(site_input)
-    if not site_url:
-        return [], ["Invalid site input."], {}
+    errors: List[str] = []
 
-    seed_sitemaps = fetch_robots_sitemaps(site_url)
-    if not seed_sitemaps:
-        seed_sitemaps = [urljoin(site_url, "/sitemap.xml")]
+    if seed_sitemaps:
+        normalized_seeds: List[str] = []
+        for seed in seed_sitemaps:
+            value = seed.strip()
+            if not value:
+                continue
+            if value.startswith(("http://", "https://")):
+                normalized_seeds.append(value)
+            elif site_url:
+                normalized_seeds.append(urljoin(site_url, value))
+            else:
+                errors.append(f"Invalid sitemap URL (needs https://): {value}")
+        seed_sitemaps = unique_preserve(normalized_seeds)
+        if not seed_sitemaps:
+            return [], errors or ["No valid sitemap URLs provided."], {}
+    else:
+        if not site_url:
+            return [], ["Invalid site input."], {}
+        seed_sitemaps = fetch_robots_sitemaps(site_url)
+        if not seed_sitemaps:
+            seed_sitemaps = [urljoin(site_url, "/sitemap.xml")]
 
     queue = list(seed_sitemaps)
     seen_sitemaps = set()
     seen_urls = set()
     urls = []
-    errors = []
     sitemap_counts: Dict[str, int] = {}
 
-    while queue and len(seen_sitemaps) < max_sitemaps and len(urls) < max_urls:
+    while queue and len(seen_sitemaps) < max_sitemaps:
         sitemap_url = queue.pop(0)
         if sitemap_url in seen_sitemaps:
             continue
@@ -287,12 +340,12 @@ def discover_urls_from_sitemaps(
         sitemap_counts[sitemap_url] = len(normalized_pages)
 
         for page in normalized_pages:
+            if len(urls) >= max_urls:
+                break
             if page in seen_urls:
                 continue
             seen_urls.add(page)
             urls.append(page)
-            if len(urls) >= max_urls:
-                break
 
         for child in sitemap_urls:
             if child in seen_sitemaps or child in queue:
@@ -367,6 +420,32 @@ def query_history(api_key: str, origin: str, form_factor: str) -> Tuple[Optional
 
     resp = requests.post(
         f"{HISTORY_ENDPOINT}?key={api_key}",
+        json=payload,
+        timeout=30,
+    )
+
+    if resp.status_code != 200:
+        return None, parse_error_message(resp)
+
+    data = resp.json()
+    if "record" not in data:
+        error = data.get("error", {}).get("message", "No record returned")
+        return None, error
+    return data, None
+
+
+def query_crux_record(
+    api_key: str,
+    target: str,
+    form_factor: str,
+    target_type: str = "url",
+) -> Tuple[Optional[Dict], Optional[str]]:
+    payload = {target_type: target}
+    if form_factor != "ALL":
+        payload["formFactor"] = form_factor
+
+    resp = requests.post(
+        f"{CRUX_ENDPOINT}?key={api_key}",
         json=payload,
         timeout=30,
     )
@@ -673,6 +752,267 @@ def build_device_metric_chart(
     )
 
 
+def summarize_share_frame(df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for metric_key in SUMMARY_METRICS:
+        values = {}
+        for suffix, label in SUMMARY_SHARE_LABELS:
+            col = f"{metric_key}_{suffix}"
+            if col not in df.columns:
+                values = {}
+                break
+            series = df[col].map(coerce_float).dropna()
+            if series.empty:
+                values = {}
+                break
+            values[label] = series.mean() * 100
+        if not values:
+            continue
+        for label, value in values.items():
+            rows.append(
+                {
+                    "metric": metric_key.upper(),
+                    "series": label,
+                    "value": value,
+                    "value_display": f"{value:.1f}%",
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def build_plotly_radar_chart(
+    summary_df: pd.DataFrame,
+    title: str,
+    show_legend: bool = True,
+) -> Optional[object]:
+    if summary_df.empty:
+        return None
+    chart_df = summary_df.copy()
+    if "rating" not in chart_df.columns and "series" in chart_df.columns:
+        chart_df = chart_df.rename(columns={"series": "rating"})
+    if "rating" not in chart_df.columns:
+        return None
+
+    rating_order = ["Good", "Needs Improvement", "Poor"]
+    palette = {
+        "Good": STATUS_COLORS["Good"],
+        "Needs Improvement": STATUS_COLORS["Needs Improvement"],
+        "Poor": STATUS_COLORS["Poor"],
+    }
+    hover_fields = {"metric": True, "rating": True, "value": ":.1f"}
+    if "value_display" in chart_df.columns:
+        hover_fields["value_display"] = True
+
+    fig = px.line_polar(
+        chart_df,
+        r="value",
+        theta="metric",
+        color="rating",
+        line_close=True,
+        markers=True,
+        category_orders={
+            "metric": SUMMARY_METRICS_UPPER,
+            "rating": rating_order,
+        },
+        color_discrete_map=palette,
+        hover_data=hover_fields,
+    )
+    fig.update_traces(line=dict(width=2), marker=dict(size=7))
+    fig.update_layout(
+        title=title,
+        showlegend=show_legend and chart_df["rating"].nunique() > 1,
+        polar=dict(
+            radialaxis=dict(
+                range=[0, 100],
+                tickfont=dict(color="black"),
+                gridcolor="black",
+                linecolor="black",
+            ),
+            angularaxis=dict(
+                tickfont=dict(color="black"),
+                linecolor="black",
+            ),
+            bgcolor="white",
+        ),
+        margin=dict(l=40, r=40, t=60, b=40),
+    )
+    return fig
+
+
+def build_category_summary_table(raw_df: pd.DataFrame) -> pd.DataFrame:
+    if raw_df.empty or "category" not in raw_df.columns:
+        return pd.DataFrame()
+
+    headers = build_export_headers()
+    share_columns = []
+    for metric_key in METRIC_DEFS.keys():
+        for suffix, _ in SUMMARY_SHARE_LABELS:
+            col_key = f"{metric_key}_{suffix}"
+            share_columns.append((col_key, headers.get(col_key, col_key)))
+
+    categories = raw_df["category"].fillna("Uncategorized")
+    rows = []
+    for category, count in categories.value_counts().items():
+        category_df = raw_df[categories == category]
+        row = {"Category": category, "URLs": int(count)}
+        for col_key, label in share_columns:
+            if col_key not in category_df.columns:
+                row[label] = None
+                continue
+            series = category_df[col_key].map(coerce_float).dropna()
+            if series.empty:
+                row[label] = None
+            else:
+                row[label] = round(series.mean() * 100, 1)
+        rows.append(row)
+
+    summary_df = pd.DataFrame(rows)
+    if summary_df.empty:
+        return summary_df
+
+    ordered_columns = ["Category", "URLs"] + [label for _, label in share_columns]
+    return summary_df.reindex(columns=ordered_columns)
+
+
+def missing_summary_metrics(summary_df: pd.DataFrame) -> List[str]:
+    if summary_df.empty or "metric" not in summary_df.columns:
+        return SUMMARY_METRICS_UPPER.copy()
+    available = set(summary_df["metric"].dropna().unique())
+    return [metric for metric in SUMMARY_METRICS_UPPER if metric not in available]
+
+
+def render_section_summaries(
+    container,
+    raw_df: pd.DataFrame,
+    origin_summary: Optional[Dict],
+) -> None:
+    if raw_df.empty:
+        container.info("No URL results available for summaries.")
+        return
+
+    container.subheader("Section summaries")
+    container.caption(
+        "Summaries are grouped by the top-level path segment (e.g. /services/* -> Services)."
+    )
+
+    origin_record = None
+    origin_label = "Overall (from URL results)"
+    origin_note = ""
+    if origin_summary:
+        origin_record = origin_summary.get("origin_record")
+        if origin_record:
+            origin_label = f"Overall ({origin_summary.get('origin', '')})"
+        origin_error = origin_summary.get("origin_record_error")
+        if origin_error:
+            origin_note = origin_error
+
+    if origin_record:
+        overall_source_df = pd.DataFrame([origin_record])
+    else:
+        overall_source_df = raw_df
+
+    overall_frame = summarize_share_frame(overall_source_df)
+    overall_chart = build_plotly_radar_chart(overall_frame, origin_label, show_legend=True)
+    if overall_chart is None:
+        container.info("No overall summary data available.")
+    else:
+        container.plotly_chart(overall_chart, use_container_width=True)
+        missing_overall = missing_summary_metrics(overall_frame)
+        if missing_overall:
+            container.caption(f"Missing metrics: {', '.join(missing_overall)}.")
+        if origin_note:
+            container.caption(f"Origin summary note: {origin_note}")
+
+    data_cols = []
+    for metric_key in SUMMARY_METRICS:
+        p75_col = f"{metric_key}_p75"
+        if p75_col in raw_df.columns:
+            data_cols.append(p75_col)
+        for suffix, _ in SUMMARY_SHARE_LABELS:
+            share_col = f"{metric_key}_{suffix}"
+            if share_col in raw_df.columns:
+                data_cols.append(share_col)
+    if data_cols:
+        summary_source = raw_df[raw_df[data_cols].notna().any(axis=1)]
+    else:
+        summary_source = raw_df
+
+    categories = summary_source.get("category")
+    if categories is None:
+        return
+
+    category_counts = categories.fillna("Uncategorized").value_counts()
+    if category_counts.empty:
+        return
+
+    default_categories = category_counts.index.tolist()[:4]
+    selected_categories = container.multiselect(
+        "Categories to summarize (max 4)",
+        category_counts.index.tolist(),
+        default=default_categories,
+        max_selections=4,
+    )
+
+    if not selected_categories:
+        return
+
+    container.caption(
+        "Share summary averages good/needs-improvement/poor shares across URLs."
+    )
+
+    cols = container.columns(2)
+    col_index = 0
+    for category in selected_categories:
+        category_df = summary_source[
+            summary_source["category"].fillna("Uncategorized") == category
+        ]
+        summary_frame = summarize_share_frame(category_df)
+        chart = build_plotly_radar_chart(
+            summary_frame,
+            f"{category} ({len(category_df)} URLs)",
+            show_legend=False,
+        )
+        if chart is None:
+            cols[col_index % 2].info(f"No summary data for {category}.")
+        else:
+            cols[col_index % 2].plotly_chart(chart, use_container_width=True)
+            missing_category = missing_summary_metrics(summary_frame)
+            if missing_category:
+                cols[col_index % 2].caption(
+                    f"Missing metrics: {', '.join(missing_category)}."
+                )
+        col_index += 1
+
+
+def render_results(container, raw_df: pd.DataFrame, origin_summary: Optional[Dict]) -> None:
+    render_section_summaries(container, raw_df, origin_summary)
+
+    df = raw_df.rename(columns=build_export_headers())
+    share_cols = [col for col in df.columns if col.endswith("share (%)")]
+    for col in share_cols:
+        df[col] = df[col].map(format_share_percent)
+    status_cols = [col for col in df.columns if col.endswith(" status")]
+    styled_df = df.style
+    if share_cols:
+        styled_df = styled_df.format({col: format_share_display for col in share_cols})
+    if status_cols:
+        styled_df = styled_df.applymap(style_status_cell, subset=status_cols)
+    container.dataframe(styled_df, use_container_width=True, hide_index=True)
+
+    summary_df = build_category_summary_table(raw_df)
+    if not summary_df.empty:
+        excel_buffer = BytesIO()
+        with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+            summary_df.to_excel(writer, sheet_name="Category Summary", index=False)
+            df.to_excel(writer, sheet_name="Raw Results", index=False)
+        container.download_button(
+            "Download results Excel",
+            data=excel_buffer.getvalue(),
+            file_name="crux_results.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+
 def update_origin_summary() -> None:
     origin_input = st.session_state.get("origin_input", "")
     show_devices = st.session_state.get("show_device_split", True)
@@ -717,6 +1057,17 @@ def update_origin_summary() -> None:
         if not history_df.empty
         else {},
     }
+
+    record_data, record_error = query_crux_record(
+        api_key,
+        normalized_origin,
+        "ALL",
+        target_type="origin",
+    )
+    if record_error:
+        summary["origin_record_error"] = record_error
+    else:
+        summary["origin_record"] = parse_crux_response(record_data)
 
     if show_devices:
         device_rows = []
@@ -925,6 +1276,7 @@ def parse_crux_response(data: Dict) -> Dict:
 def build_export_headers() -> Dict[str, str]:
     headers = {
         "url": "URL",
+        "category": "Category",
         "collection_period": "Collection period",
         "form_factor": "Form factor",
     }
@@ -949,24 +1301,7 @@ def parse_error_message(resp: requests.Response) -> str:
 
 
 def query_crux(api_key: str, url: str, form_factor: str) -> Tuple[Optional[Dict], Optional[str]]:
-    payload = {"url": url}
-    if form_factor != "ALL":
-        payload["formFactor"] = form_factor
-
-    resp = requests.post(
-        f"{CRUX_ENDPOINT}?key={api_key}",
-        json=payload,
-        timeout=30,
-    )
-
-    if resp.status_code != 200:
-        return None, parse_error_message(resp)
-
-    data = resp.json()
-    if "record" not in data:
-        error = data.get("error", {}).get("message", "No record returned")
-        return None, error
-    return data, None
+    return query_crux_record(api_key, url, form_factor, target_type="url")
 
 
 def get_default_api_key() -> str:
@@ -1042,6 +1377,8 @@ def main() -> None:
         st.session_state["origin_summary"] = None
     if "origin_error" not in st.session_state:
         st.session_state["origin_error"] = ""
+    if "results_df" not in st.session_state:
+        st.session_state["results_df"] = None
 
     origin_error = st.session_state.get("origin_error", "")
     summary_data = st.session_state.get("origin_summary")
@@ -1063,14 +1400,44 @@ def main() -> None:
         urls_preview = read_urls_from_upload(upload)
         st.write(f"Found {len(urls_preview)} URL(s).")
     else:
+        sitemap_mode = st.radio(
+            "Sitemap discovery",
+            ["Auto (robots.txt)", "Manual sitemap URLs"],
+            horizontal=True,
+        )
+        manual_sitemaps_text = ""
+        seed_sitemaps: List[str] = []
+        if sitemap_mode == "Manual sitemap URLs":
+            manual_sitemaps_text = st.text_area(
+                "Sitemap or sitemap index URLs (one per line)",
+                height=120,
+                placeholder="https://www.example.com/sitemap.xml\nhttps://www.example.com/sitemap_index.xml",
+            )
+            seed_sitemaps = read_sitemap_seeds_from_text(manual_sitemaps_text)
+            if seed_sitemaps:
+                st.write(f"Found {len(seed_sitemaps)} sitemap seed(s).")
+
         max_sitemaps = st.number_input("Max sitemaps to crawl", 1, 200, 20, 1)
         max_urls = st.number_input("Max URLs to fetch", 1, 10000, 500, 50)
-        st.caption("Sitemaps are discovered via the robots.txt of the origin specified above. Subject to firewalls.")
+        if sitemap_mode == "Auto (robots.txt)":
+            st.caption(
+                "Sitemaps are discovered via the robots.txt of the origin specified above. Subject to firewalls."
+            )
+        else:
+            st.caption("Sitemaps are crawled from the URLs you provide. Subject to firewalls.")
 
         if st.button("Fetch sitemaps"):
             normalized_origin = normalize_origin_input(origin_input)
-            if not normalized_origin:
+            manual_relative = any(
+                seed and not seed.startswith(("http://", "https://"))
+                for seed in seed_sitemaps
+            )
+            if sitemap_mode == "Manual sitemap URLs" and not seed_sitemaps:
+                st.error("Provide at least one sitemap URL or switch to Auto.")
+            elif sitemap_mode == "Auto (robots.txt)" and not normalized_origin:
                 st.error("Enter a valid origin above (e.g. https://www.example.com).")
+            elif sitemap_mode == "Manual sitemap URLs" and manual_relative and not normalized_origin:
+                st.error("Enter a valid origin above or use absolute sitemap URLs.")
             else:
                 status = st.empty()
                 status.write("Discovering sitemaps...")
@@ -1078,6 +1445,7 @@ def main() -> None:
                     normalized_origin,
                     int(max_sitemaps),
                     int(max_urls),
+                    seed_sitemaps=seed_sitemaps if sitemap_mode == "Manual sitemap URLs" else None,
                 )
                 st.session_state["sitemap_urls"] = urls
                 st.session_state["sitemap_counts"] = sitemap_counts
@@ -1126,7 +1494,7 @@ def main() -> None:
 
             for index, url in enumerate(urls, start=1):
                 status.write(f"Fetching {index}/{len(urls)}: {url}")
-                row = {"url": url}
+                row = {"url": url, "category": categorize_url(url)}
 
                 crux_data, crux_error = query_crux(api_key, url, form_factor)
                 if crux_error:
@@ -1140,23 +1508,16 @@ def main() -> None:
                     time.sleep(delay)
 
             status.write("Done.")
-            df = pd.DataFrame(results).rename(columns=build_export_headers())
-            share_cols = [col for col in df.columns if col.endswith("share (%)")]
-            for col in share_cols:
-                df[col] = df[col].map(format_share_percent)
-            status_cols = [col for col in df.columns if col.endswith(" status")]
-            styled_df = df.style
-            if share_cols:
-                styled_df = styled_df.format({col: format_share_display for col in share_cols})
-            if status_cols:
-                styled_df = styled_df.applymap(style_status_cell, subset=status_cols)
-            st.dataframe(styled_df, use_container_width=True, hide_index=True)
-            st.download_button(
-                "Download results CSV",
-                data=df.to_csv(index=False),
-                file_name="crux_results.csv",
-                mime="text/csv",
-            )
+            raw_df = pd.DataFrame(results)
+            st.session_state["results_df"] = raw_df
+
+    results_df = st.session_state.get("results_df")
+    if isinstance(results_df, pd.DataFrame) and not results_df.empty:
+        render_results(
+            st.container(),
+            results_df,
+            st.session_state.get("origin_summary"),
+        )
 
     st.subheader("Metric notes")
     notes = [

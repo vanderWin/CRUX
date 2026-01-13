@@ -4,3 +4,4 @@ pandas
 python-dotenv
 altair
 plotly
+openpyxl
